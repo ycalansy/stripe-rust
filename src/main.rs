@@ -1,236 +1,303 @@
-use std::{collections::HashMap, io::Write};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-use openapiv3::{OpenAPI, ReferenceOr, Schema, SchemaKind, Type};
-use quote::{format_ident, quote, ToTokens};
+use openapiv3::{AdditionalProperties, OpenAPI, ReferenceOr, SchemaKind, Type as SchemaType};
+use proc_macro2::TokenStream;
+use quote::{format_ident, quote};
+
+struct Schema<'s> {
+    inner: &'s openapiv3::Schema,
+    parsed: Option<DataType>,
+}
+
+impl<'s> Schema<'s> {
+    pub fn new(inner: &'s openapiv3::Schema) -> Self {
+        Self { inner, parsed: None }
+    }
+}
+
+#[derive(Clone)]
+struct DataType {
+    name: String,
+    token_stream: TokenStream,
+    collection: bool,
+    expandable: bool,
+}
+
+type Reference<T> = Rc<RefCell<T>>;
+
+fn reference_of<T>(value: T) -> Reference<T> {
+    Rc::new(RefCell::new(value))
+}
 
 fn main() {
     let data = std::fs::read_to_string("openapi.json").unwrap();
     let spec = serde_json::from_str::<OpenAPI>(&data).unwrap();
 
-    let mut generated_code_memo = HashMap::new();
-
     let components = spec.components.unwrap();
     let schemas = &components.schemas;
+
+    let mut schema_memo = HashMap::with_capacity(schemas.len());
 
     for (schema_name, schema) in schemas {
         let schema = schema.as_item().unwrap();
         if !schema.schema_data.extensions.contains_key("x-stripeEvent") {
-            parse_schema(schema, None, schema_name, &mut generated_code_memo).unwrap();
+            let schema = reference_of(Schema::new(schema));
+            schema_memo.insert(schema_name.clone(), schema);
         }
     }
 
-    // let account = schemas
-    //     .get("account")
-    //     .and_then(|schema| schema.as_item())
-    //     .unwrap();
-    //
-    // parse_schema(account, None, "account", &mut generated_code_memo).unwrap();
+    let schema_memo_clone = schema_memo.clone();
 
-    for code in generated_code_memo.values() {
-        println!("{}", code);
+    for (schema_name, schema) in &schema_memo_clone {
+        parse(schema, None, Some(schema_name), &mut schema_memo);
     }
 
-    // Dump all generated code to a file.
-    let mut file = std::fs::File::create("generated.rs").unwrap();
+    for (schema_name, schema) in &schema_memo {
+        let schema = schema.borrow();
+        match &schema.parsed {
+            Some(data_type) => {
+                println!("{}", data_type.token_stream.to_string());
+            }
+            None => {
+                println!("Got None for {}", schema_name);
+            }
+        }
+    }
 
-    for code in generated_code_memo.values() {
-        file.write_all(code.as_bytes()).unwrap();
-        file.write(b"\n").unwrap();
+    let code = quote! {
+        #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+        #[serde(untagged)]
+        pub enum Expandable<T> {
+            Id(String),
+            Resource(T),
+        }
+    };
+
+    println!("{}", code.to_string());
+
+    let subscription = schema_memo.get("subscription").unwrap().borrow();
+
+    match &subscription.parsed {
+        Some(data_type) => {
+            println!("{}", data_type.token_stream.to_string());
+        }
+        None => {
+            println!("Got None for subscription");
+        }
     }
 }
 
-fn parse_schema(schema: &Schema, parent_key: Option<&str>, current_key: &str, generated_code_memo: &mut HashMap<String, String>) -> anyhow::Result<(syn::Type, bool)> {
-    let composite_key = match parent_key {
-        Some(parent_key) => format!("{}_{}", parent_key, current_key),
-        None => current_key.to_owned(),
+fn parse<'s>(schema: &Reference<Schema<'s>>, parent_schema_name: Option<&str>, current_schema_name: Option<&str>, schema_memo: &mut HashMap<String, Reference<Schema<'s>>>) -> DataType {
+    let fully_qualified_schema_name = vec![
+        parent_schema_name,
+        current_schema_name,
+    ];
+
+    let fully_qualified_schema_name = fully_qualified_schema_name
+        .into_iter()
+        .filter_map(|x| x)
+        .collect::<Vec<&str>>()
+        .join("_");
+
+    let mut data_type = DataType {
+        name: delimited_string_to_pascal_case(&fully_qualified_schema_name),
+        token_stream: TokenStream::new(),
+        collection: false,
+        expandable: false,
     };
 
-    let type_name = snake_case_to_pascal_case(&composite_key);
-    let mut type_name = force_parse_type(&type_name);
+    let data_schema = schema.borrow().inner;
 
-    let mut is_collection = false;
+    let schema_data = &data_schema.schema_data;
+    let schema_kind = &data_schema.schema_kind;
 
-    let schema_data = &schema.schema_data;
-    let schema_kind = &schema.schema_kind;
+    let expandable_property_memo = schema_data
+        .extensions
+        .get("x-expandableFields")
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|field| (field, ()))
+        .collect::<HashMap<_, _>>();
 
     match schema_kind {
-        SchemaKind::Type(ty) => match ty {
-            Type::String(ty) => {
-                let variants = ty
-                    .enumeration
-                    .iter()
-                    .flatten()
-                    .map(|variant| {
-                        let variant = snake_case_to_pascal_case(variant);
-
-                        let variant = match syn::parse_str::<syn::Variant>(&variant) {
-                            Ok(variant) => variant,
-                            Err(_) => {
-                                let is_numeric_start = variant
-                                    .chars()
-                                    .next()
-                                    .map(|c| c.is_numeric())
-                                    .unwrap_or_default();
-
-                                if is_numeric_start {
-                                    force_parse_enum_variant(&format!("No_{}", variant))
-                                } else {
-                                    force_parse_enum_variant(&format!("{}_", variant))
+        SchemaKind::Type(schema_kind_type) => match schema_kind_type {
+            SchemaType::String(_) => {
+                data_type.name = String::from("String");
+            }
+            SchemaType::Number(_) => {
+                data_type.name = String::from("f64");
+            }
+            SchemaType::Integer(_) => {
+                data_type.name = String::from("i64");
+            }
+            SchemaType::Object(schema_type_object) => {
+                if let Some(additional_properties) = &schema_type_object.additional_properties {
+                    match additional_properties {
+                        AdditionalProperties::Schema(additional_properties_schema) => {
+                            let additional_properties_data_type = match &**additional_properties_schema {
+                                ReferenceOr::Reference { reference } => {
+                                    let schema_name = reference.split('/').last().unwrap();
+                                    let reference_schema = Rc::clone(schema_memo.get(schema_name).unwrap());
+                                    parse(
+                                        &reference_schema,
+                                        Some(&fully_qualified_schema_name),
+                                        None,
+                                        schema_memo,
+                                    )
                                 }
-                            }
-                        };
+                                ReferenceOr::Item(item_schema) => parse(
+                                    &reference_of(Schema::new(item_schema)),
+                                    Some(&fully_qualified_schema_name),
+                                    None,
+                                    schema_memo,
+                                ),
+                            };
 
-                        quote! {
-                            #variant,
+                            data_type.name = format!("HashMap<String, {}>", additional_properties_data_type.name);
+                            data_type.collection = true;
+
+                            return data_type;
                         }
-                    })
-                    .collect::<Vec<_>>();
-
-                if variants.is_empty() || (current_key == "object" && variants.len() == 1) {
-                    type_name = force_parse_type("String");
-                } else {
-                    let code = quote! {
-                        #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-                        #[serde(rename_all = "snake_case")]
-                        pub enum #type_name {
-                            #(#variants)*
+                        _ => {
+                            unreachable!("Unknown AdditionalProperties, expected AdditionalProperties::Schema");
                         }
-                    };
-
-                    let syntax_tree = syn::parse2::<syn::File>(code).unwrap();
-                    let formatted_code = prettyplease::unparse(&syntax_tree);
-
-                    generated_code_memo.insert(composite_key, formatted_code);
-                }
-            }
-            Type::Number(_) => {
-                type_name = force_parse_type("f64");
-            }
-            Type::Integer(_) => {
-                type_name = force_parse_type("i64");
-            }
-            Type::Object(ty) => {
-                if current_key == "metadata" && ty.additional_properties.is_some() {
-                    type_name = force_parse_type("HashMap<String, String>");
-                    return Ok((type_name, true));
+                    }
                 }
 
-                let required_field_memo = ty
+                let required_property_memo = schema_type_object
                     .required
                     .iter()
-                    .map(|field| (field, ()))
+                    .map(|property| (property, ()))
                     .collect::<HashMap<_, _>>();
 
-                let fields = ty
+                let properties = schema_type_object
                     .properties
                     .iter()
                     .map(|(property_name, property_schema)| {
-                        let field_name = match syn::parse_str::<syn::Ident>(property_name) {
+                        let parsed_property_name = match syn::parse_str::<syn::Ident>(property_name) {
                             Ok(field_name) => field_name,
                             Err(_) => format_ident!("r#{}", property_name),
                         };
 
-                        let (field_type, is_collection) = match property_schema {
+                        let property_data_type = match property_schema {
                             ReferenceOr::Reference { reference } => {
-                                let field_type = reference
-                                    .split('/')
-                                    .last()
-                                    .map(|chunk| snake_case_to_pascal_case(chunk))
-                                    .map(|field_type| force_parse_type(&field_type))
-                                    .unwrap();
-                                (field_type, false)
+                                let schema_name = reference.split('/').last().unwrap();
+                                let reference_schema = Rc::clone(schema_memo.get(schema_name).unwrap());
+                                parse(
+                                    &reference_schema,
+                                    Some(&fully_qualified_schema_name),
+                                    Some(property_name),
+                                    schema_memo,
+                                )
                             }
-                            ReferenceOr::Item(field_schema) => parse_schema(
-                                field_schema,
-                                Some(&composite_key),
-                                property_name,
-                                generated_code_memo,
-                            )
-                            .unwrap(),
+                            ReferenceOr::Item(item_schema) => parse(
+                                &reference_of(Schema::new(item_schema)),
+                                Some(&fully_qualified_schema_name),
+                                Some(property_name),
+                                schema_memo,
+                            ),
                         };
 
-                        if required_field_memo.contains_key(property_name) || is_collection {
-                            quote! {
-                                pub #field_name: #field_type,
-                            }
+                        if property_name == "id" {
+                            data_type.expandable = true;
+                        }
+
+                        let mut property_derive_input = None;
+                        let mut property_data_type_name = property_data_type.name.clone();
+
+                        // if expandable_property_memo.contains_key(property_name) {
+                        //     property_data_type_name = format!("Expandable<{}>", property_data_type_name);
+                        // }
+                        if property_data_type.collection {
+                            let derive_input = syn::parse_str::<TokenStream>("#[serde(default)]").unwrap();
+                            property_derive_input = Some(derive_input);
                         } else {
-                            quote! {
-                                pub #field_name: Option<#field_type>,
+                            if required_property_memo.contains_key(property_name) {
+                                property_data_type_name = format!("Option<{}>", property_data_type_name);
                             }
+                        }
+
+                        let property_data_type_name = syn::parse_str::<syn::Type>(&property_data_type_name).unwrap();
+
+                        quote! {
+                            #property_derive_input
+                            pub #parsed_property_name: #property_data_type_name,
                         }
                     });
 
+                let data_type_name = format_ident!("{}", data_type.name);
+
                 let code = quote! {
                     #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-                    pub struct #type_name {
-                        #(#fields)*
+                    pub struct #data_type_name {
+                        #(#properties)*
                     }
                 };
 
-                let syntax_tree = syn::parse2::<syn::File>(code).unwrap();
-                let formatted_code = prettyplease::unparse(&syntax_tree);
+                data_type.token_stream = code;
+                schema.borrow_mut().parsed = Some(data_type.clone());
 
-                generated_code_memo.insert(composite_key, formatted_code);
+                if !schema_memo.contains_key(&fully_qualified_schema_name) {
+                    schema_memo.insert(fully_qualified_schema_name, schema.clone());
+                }
             }
-            Type::Array(ty) => {
-                let item_type_name = match ty.items.as_ref().unwrap() {
+            SchemaType::Array(schema_type_array) => {
+                let item_data_type = match schema_type_array.items.as_ref().unwrap() {
                     ReferenceOr::Reference { reference } => {
-                        let item_type_name = reference
-                            .split('/')
-                            .last()
-                            .map(|chunk| snake_case_to_pascal_case(chunk))
-                            .map(|field_type| force_parse_type(&field_type))
-                            .unwrap();
-                        item_type_name
-                    }
-                    ReferenceOr::Item(item_schema) => {
-                        parse_schema(
-                            item_schema,
-                            Some(&composite_key),
-                            "item",
-                            generated_code_memo,
+                        let schema_name = reference.split('/').last().unwrap();
+                        let reference_schema = Rc::clone(schema_memo.get(schema_name).unwrap());
+                        parse(
+                            &reference_schema,
+                            Some(&fully_qualified_schema_name),
+                            None,
+                            schema_memo,
                         )
-                        .unwrap()
-                        .0
                     }
+                    ReferenceOr::Item(item_schema) => parse(
+                        &reference_of(Schema::new(item_schema)),
+                        Some(&fully_qualified_schema_name),
+                        None,
+                        schema_memo,
+                    ),
                 };
 
-                type_name = syn::parse_quote!(Vec<#item_type_name>);
+                data_type.name = format!("Vec<{}>", item_data_type.name);
+                data_type.collection = true;
             }
-            Type::Boolean(_) => type_name = force_parse_type("bool"),
+            SchemaType::Boolean(_) => {
+                data_type.name = String::from("bool");
+            }
         },
-        SchemaKind::AnyOf { any_of } => type_name = force_parse_type("ReplaceMeWithAnyOfSpec"),
-        _ => unimplemented!(),
-    };
-
-    Ok((type_name, is_collection))
-}
-
-fn to_title_case(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(first_char) => first_char.to_uppercase().collect::<String>() + chars.as_str(),
+        SchemaKind::AnyOf { any_of: schema_kind_any_of } => {
+            data_type.name = String::from("Temp");
+        }
+        _ => unreachable!("Unknown SchemaKind, expected either SchemaKind::Type or SchemaKind::AnyOf"),
     }
+
+    data_type
 }
 
-fn snake_case_to_pascal_case(s: &str) -> String {
-    let parts: Vec<&str> = s.split(&['_', '.', '-']).collect();
-    let mut output = to_title_case(parts[0]);
-    for part in parts.into_iter().skip(1) {
-        output.push_str(&to_title_case(part));
+fn delimited_string_to_pascal_case(s: &str) -> String {
+    let mut converted = String::with_capacity(s.len());
+    let mut next_uppercase = true;
+
+    for c in s.chars() {
+        match c {
+            '-' | '_' | '.' => {
+                next_uppercase = true;
+            }
+            _ => match next_uppercase {
+                true => {
+                    next_uppercase = false;
+                    converted.push(c.to_ascii_uppercase());
+                }
+                false => {
+                    converted.push(c);
+                }
+            },
+        }
     }
-    output
-}
 
-fn force_parse_syntax<T: syn::parse::Parse>(s: &str) -> T {
-    syn::parse_str::<T>(s).expect(&format!("Failed to parse syntax: {}", s))
-}
-
-fn force_parse_type(s: &str) -> syn::Type {
-    force_parse_syntax::<syn::Type>(s)
-}
-
-fn force_parse_enum_variant(s: &str) -> syn::Variant {
-    force_parse_syntax::<syn::Variant>(s)
+    converted
 }
